@@ -1,0 +1,210 @@
+
+name: Build Flow INR APK
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: flow-inr-apk-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build Android APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Validate uploaded files
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          for file in \
+            "Flow-INR-Android-Project.zip" \
+            "index.html" \
+            "flow_icon.png"; do
+            if [[ ! -f "$file" ]]; then
+              echo "::error::Missing required file: $file"
+              exit 1
+            fi
+          done
+
+          if [[ ! -s "index.html" ]]; then
+            echo "::error::index.html is empty."
+            exit 1
+          fi
+
+          if [[ ! -s "flow_icon.png" ]]; then
+            echo "::error::flow_icon.png is empty."
+            exit 1
+          fi
+
+          echo "All required repository files are present."
+
+      - name: Extract Android project
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p extracted-project
+          unzip -q Flow-INR-Android-Project.zip \
+            -d extracted-project
+
+          GRADLE_WRAPPER="$(find extracted-project \
+            -type f -name gradlew -print -quit)"
+
+          if [[ -z "$GRADLE_WRAPPER" ]]; then
+            echo "::error::No gradlew found in the ZIP."
+            echo "The ZIP must contain the actual Android project."
+            exit 1
+          fi
+
+          PROJECT_DIR="$(dirname "$GRADLE_WRAPPER")"
+
+          if [[ ! -d "$PROJECT_DIR/app" ]]; then
+            echo "::error::The Gradle project has no app directory."
+            exit 1
+          fi
+
+          if [[ ! -d "$PROJECT_DIR/gradle" ]]; then
+            echo "::error::The Gradle wrapper files are incomplete."
+            exit 1
+          fi
+
+          echo "ANDROID_PROJECT_DIR=$PROJECT_DIR" \
+            >> "$GITHUB_ENV"
+
+          echo "Android project found: $PROJECT_DIR"
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: gradle
+
+      - name: Install custom app icon
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          PROJECT="$ANDROID_PROJECT_DIR"
+
+          mkdir -p "$PROJECT/app/src/main/res/drawable-nodpi"
+
+          cp flow_icon.png \
+            "$PROJECT/app/src/main/res/drawable-nodpi/flow_icon.png"
+
+          test -s \
+            "$PROJECT/app/src/main/res/drawable-nodpi/flow_icon.png"
+
+      - name: Install optimized HTML
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          PROJECT="$ANDROID_PROJECT_DIR"
+          ASSETS="$PROJECT/app/src/main/assets"
+
+          mkdir -p "$ASSETS"
+          cp index.html "$ASSETS/index.html"
+
+          test -s "$ASSETS/index.html"
+
+          echo "Optimized HTML copied into Android assets."
+
+      - name: Configure application icon
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          MANIFEST="$ANDROID_PROJECT_DIR/app/src/main/AndroidManifest.xml"
+
+          if [[ ! -f "$MANIFEST" ]]; then
+            echo "::error::AndroidManifest.xml not found."
+            exit 1
+          fi
+
+          python3 - "$MANIFEST" <<'PY'
+          import re
+          import sys
+          from pathlib import Path
+
+          path = Path(sys.argv[1])
+          text = path.read_text(encoding="utf-8")
+
+          if not re.search(r"<application\b", text):
+              raise SystemExit("No application tag found in manifest.")
+
+          icon = 'android:icon="@drawable/flow_icon"'
+
+          if re.search(r"<application\b[^>]*\bandroid:icon\s*=", text):
+              text = re.sub(
+                  r'(<application\b[^>]*?)\s+android:icon\s*=\s*'
+                  r'(["\']).*?\2',
+                  lambda match: match.group(1) + " " + icon,
+                  text,
+                  count=1,
+                  flags=re.DOTALL,
+              )
+          else:
+              text = re.sub(
+                  r"<application\b",
+                  lambda match: match.group(0) + " " + icon,
+                  text,
+                  count=1,
+              )
+
+          path.write_text(text, encoding="utf-8")
+          print("Application icon configured.")
+          PY
+
+      - name: Make Gradle wrapper executable
+        shell: bash
+        run: |
+          chmod +x "$ANDROID_PROJECT_DIR/gradlew"
+
+      - name: Build debug APK
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cd "$ANDROID_PROJECT_DIR"
+
+          ./gradlew --no-daemon --stacktrace assembleDebug
+
+      - name: Verify APK
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          APK="$ANDROID_PROJECT_DIR/app/build/outputs/apk/debug/app-debug.apk"
+
+          if [[ ! -s "$APK" ]]; then
+            echo "::error::Build finished but app-debug.apk was not found."
+            find "$ANDROID_PROJECT_DIR/app/build/outputs" \
+              -maxdepth 5 -type f 2>/dev/null || true
+            exit 1
+          fi
+
+          echo "APK successfully built."
+          ls -lh "$APK"
+
+      - name: Upload Flow INR debug APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: Flow-INR-debug-apk
+          path: ${{ env.ANDROID_PROJECT_DIR }}/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+          retention-days: 14
+          
